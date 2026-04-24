@@ -1,59 +1,74 @@
-# Dammage Backend — Road Damage & Waste Detection API
+# Dammage Backend
 
-FastAPI backend serving two YOLO ensemble endpoints:
+FastAPI + TFLite waste & pothole detection. Stores reports in MongoDB with GeoJSON
+location; uploads images to MinIO. Auto-resolves entries within 500 m when a new
+clean photo of the same spot is uploaded.
 
-- `POST /detect/road` — 4-model RDD2022 ensemble (Potholes, Linear / Transverse / Alligator Cracks, Patch)
-- `POST /detect/waste` — TACO + PhucHuwu + palakaeron-pile ensemble (plastic, glass, metal, paper, cardboard, medical, e-waste, banana/orange peel, overflow/garbage pile)
-
-Both endpoints accept a multipart file upload (`file=<image>`) and return JSON with normalised English labels, confidence, and bounding boxes.
-
-## Setup
+## Quick start
 
 ```bash
-# 1. Install deps (requires uv — https://github.com/astral-sh/uv)
-uv sync
+make install     # uv sync
+make up          # docker compose up MinIO + MongoDB
+make run         # uvicorn on 0.0.0.0:8000
+make check       # health + recent reports
+```
 
-# 2. Download all model weights (~400 MB) into models/
-bash scripts/download_models.sh
+## Routes
 
-# 3. Run
-uv run uvicorn main:app --host 127.0.0.1 --port 8000
+| Method | Path        | Description |
+|--------|-------------|-------------|
+| GET    | `/`         | Health — model / MinIO / Mongo status |
+| POST   | `/report`   | Upload image + lat/lng; runs trash + pothole detect, stores or auto-resolves |
+| POST   | `/resolve`  | Explicit cleanup by (lat, lng) without uploading an image |
+| GET    | `/reports`  | Pull saved reports: `{image, coordinates, time, severity_score, type}` |
+
+`POST /report` form fields: `file` (image), `lat`, `lng`, optional `email`.
+If nothing is detected → deletes all reports within `CLEANUP_RADIUS_M` (default 500 m).
+Otherwise → inserts one document per detected type (`trash` / `pothole`).
+
+`POST /resolve` form fields: `lat`, `lng`, optional `type` (`trash` | `pothole`),
+optional `radius_m`. Deletes matching reports.
+
+`GET /reports` query params: `limit` (default 200), optional `type`.
+
+## Layout
+
+```
+backend/
+├── src/
+│   ├── __init__.py
+│   ├── main.py     # FastAPI app + route handlers
+│   ├── config.py   # env vars, category/class metadata, colors
+│   ├── ml.py       # model load, inference, severity scoring, annotation
+│   └── storage.py  # MinIO + MongoDB init + upload helpers
+├── best_int8.tflite                     # pothole detector (1 class)
+├── yolov8n-waste-12cls-best_int8.tflite # waste detector (12 classes)
+├── Makefile
+└── pyproject.toml
 ```
 
 ## Models
 
-Weights are not committed (GitHub's 100MB-per-file cap). `scripts/download_models.sh` fetches them from the original GitHub / HuggingFace sources.
+- **Waste**: YOLOv8n int8 TFLite, 12 classes — battery, biological, brown-glass,
+  cardboard, clothes, green-glass, metal, paper, plastic, shoes, trash, white-glass.
+  Mapped in `config.py::CLASS_CATEGORY` to 8 categories (plastic/paper/glass/metal/
+  organic/hazardous/textile/mixed) with pollution, hazard, and decomposition metadata.
+- **Road**: single-class TFLite pothole detector.
 
-| File | Source | Size | Purpose |
-|------|--------|------|---------|
-| `road.pt` | oracl4/RoadDamageDetection | 90 MB | YOLOv8s RDD2022, 4 classes |
-| `road_yolo11.pt` | dayeeen/road-damage-detection-yolov11 | 19 MB | YOLO11 RDD (Indonesian labels, auto-translated) |
-| `road_yolo11x.pt` | Nothingger/RDD_YOLO_pretrained | 114 MB | YOLO11x RDD, biggest backbone |
-| `road_yolo12s.pt` | rezzzq/yolo12s-road-damage-rdd2022 | 19 MB | YOLOv12s RDD, adds Patch class |
-| `waste_yolo11.pt` | PhucHuwu/YOLOv8_Detecting_and_Classifying_Waste | 6 MB | 7 categorical waste classes |
-| `waste_taco.pt` | jeremy-rico/litter-detection | 52 MB | YOLOv8m TACO, 60 street-litter classes |
-| `waste_yolo11l.pt` | Oguri02/trash-detection-yolo11l | 51 MB | YOLO11l, 4 material classes |
-| `waste_material.pt` | HrutikAdsare/waste-detection-yolov8 | 52 MB | YOLOv8m, 8 material classes |
-| `waste_pile.pt` | palakaeron/Garbage-detection-ngr | 6 MB | Pile-level detection (garbage / overflow / bin) |
+Both load via `ultralytics.YOLO(task="detect")`. TFLite runtime is provided by
+`ai-edge-litert` with a small `tflite_runtime` shim because upstream
+`tflite-runtime` doesn't publish wheels for Python 3.12.
 
-## Inference tuning
+## Env vars (optional)
 
-Knobs in `main.py`:
-
-- `INFER_CONF`, `INFER_IOU`, `INFER_IMGSZ`, `INFER_AUGMENT`, `INFER_MAX_DET` — defaults optimised for accuracy (1536px + TTA + low conf).
-- `TILE_SIZE`, `TILE_OVERLAP`, `TILE_MIN_IMG` — SAHI-style tiling on large images for small-object recall.
-- Per-model confidence overrides inside `run_waste_ensemble` to suppress noisy models.
-- `_filter_waste` — drops oversized boxes (shop signs, buildings) and requires pile labels to cover ≥ 8% of the image.
-
-Pile detector runs at its native 640 px with augment disabled — at 1536 px it hallucinates "overflow" on shop signs.
-
-## API example
-
-```bash
-curl -X POST -F "file=@pothole.jpg" http://127.0.0.1:8000/detect/road
-# {"kind":"road","width":1280,"height":768,"detections":[{"label":"Pothole","confidence":0.924,"box":{"x1":..,"y1":..,"x2":..,"y2":..}}, ...]}
-```
-
-## License
-
-Model weights retain their original upstream licenses — see each source repo linked above.
+| Var                   | Default                             |
+|-----------------------|-------------------------------------|
+| `MINIO_ENDPOINT`      | `127.0.0.1:9000`                    |
+| `MINIO_ROOT_USER`     | `admin`                             |
+| `MINIO_ROOT_PASSWORD` | `password123`                       |
+| `MINIO_BUCKET`        | `dammage`                           |
+| `MINIO_PUBLIC_HOST`   | `http://192.168.1.3:9000`           |
+| `MONGO_URI`           | `mongodb://127.0.0.1:27017`         |
+| `MONGO_DB`            | `dammage`                           |
+| `MONGO_COLL`          | `reports`                           |
+| `CLEANUP_RADIUS_M`    | `500`                               |

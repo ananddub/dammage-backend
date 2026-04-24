@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.git/
+.gitignore
+.python-version
+README.md
+CLAUDE.md
+PROJECT.md
+Makefile
+# Legacy tflite, no longer loaded
+yolov8n-waste-12cls-best_int8.tflite
+# YOLO-E .pt auto-downloads during image build; avoid sending a stale local copy
+yoloe-*.pt
+docker-compose.yml
+docker-compose.prod.yml
+Dockerfile
+.dockerignore

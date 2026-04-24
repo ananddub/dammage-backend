@@ -4,8 +4,12 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "ai-edge-litert>=2.1.4",
     "fastapi>=0.136.1",
+    "minio>=7.2.20",
+    "opencv-python-headless>=4.13.0.92",
     "pillow>=12.2.0",
+    "pymongo>=4.17.0",
     "python-multipart>=0.0.26",
     "ultralytics>=8.4.41",
     "uvicorn[standard]>=0.46.0",

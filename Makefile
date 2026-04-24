@@ -1,27 +1,44 @@
-.PHONY: install models run dev setup check
+.PHONY: help install up down dev run check reset clean
 
-# First-time setup: install deps + download models
-setup: install models
+COMPOSE := docker compose -f ../frontend/docker-compose.yml
+
+help:
+	@echo "Common:"
+	@echo "  make install    Install Python deps via uv"
+	@echo "  make up         Start MinIO + MongoDB (docker compose)"
+	@echo "  make down       Stop MinIO + MongoDB"
+	@echo "  make dev        Run API with hot reload on :8000"
+	@echo "  make run        Run API on :8000 (all interfaces, LAN-reachable)"
+	@echo "  make check      Hit / and /reports"
+	@echo "  make reset      Wipe reports collection + MinIO bucket"
+	@echo "  make clean      Remove __pycache__"
 
 install:
 	uv sync
 
-models:
-	bash scripts/download_models.sh
+up:
+	$(COMPOSE) up -d
 
-# Run server (production-ish)
-run:
-	uv run uvicorn main:app --host 0.0.0.0 --port 8000
+down:
+	$(COMPOSE) down
 
-# Run server with hot reload for development
 dev:
-	uv run uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+	uv run uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
 
-# Smoke test both endpoints (requires a test image)
+run:
+	uv run uvicorn src.main:app --host 0.0.0.0 --port 8000
+
 check:
-	@echo "--- Health ---"
-	curl -s http://127.0.0.1:8000/ | python3 -m json.tool
-	@echo "\n--- Road (test.jpg) ---"
-	curl -s -X POST -F "file=@test.jpg" http://127.0.0.1:8000/detect/road | python3 -m json.tool
-	@echo "\n--- Waste (test.jpg) ---"
-	curl -s -X POST -F "file=@test.jpg" http://127.0.0.1:8000/detect/waste | python3 -m json.tool
+	@echo "--- / ---"
+	@curl -s http://127.0.0.1:8000/ | python3 -m json.tool
+	@echo "\n--- /reports ---"
+	@curl -s http://127.0.0.1:8000/reports | python3 -m json.tool
+
+reset:
+	@echo "Wiping dammage.reports + MinIO dammage/*"
+	@docker exec dammage-mongo mongosh --quiet --eval 'db.getSiblingDB("dammage").reports.deleteMany({})' || true
+	@docker exec dammage-minio mc alias set local http://127.0.0.1:9000 admin password123 >/dev/null 2>&1 || true
+	@docker exec dammage-minio mc rm --recursive --force local/dammage/ >/dev/null 2>&1 || true
+
+clean:
+	find . -type d -name __pycache__ -not -path "./.venv/*" -exec rm -rf {} +

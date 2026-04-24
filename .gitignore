@@ -9,12 +9,19 @@ wheels/
 # Virtual environments
 .venv
 
-# Model weights (downloaded via scripts/download_models.sh — not versioned)
+# Model weights — YOLO / ONNX / TensorRT / CoreML auto-downloaded or too large
 *.pt
 *.onnx
 *.engine
 *.mlmodel
 models/
+
+# CLIP text encoder (auto-downloaded by YOLO-E on first use, ~600 MB)
+mobileclip_blt.ts
+
+# Legacy 12-class waste tflite — superseded by yoloe-11l-seg.pt. Kept on disk
+# for reference but not versioned (26 MB, and not loaded anymore).
+yolov8n-waste-12cls-best_int8.tflite
 
 # Editor / OS
 .vscode/
