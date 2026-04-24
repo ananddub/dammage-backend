@@ -8,7 +8,6 @@ dependencies = [
     "fastapi>=0.136.1",
     "minio>=7.2.20",
     "opencv-python-headless>=4.13.0.92",
-    "paho-mqtt>=2.1.0",
     "pillow>=12.2.0",
     "pymongo>=4.17.0",
     "python-multipart>=0.0.26",

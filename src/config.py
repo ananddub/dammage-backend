@@ -91,23 +91,22 @@ MINIO_PUBLIC_HOST = os.getenv("MINIO_PUBLIC_HOST", "http://192.168.1.3:9000")
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017")
 MONGO_DB = os.getenv("MONGO_DB", "dammage")
 MONGO_COLL = os.getenv("MONGO_COLL", "reports")
-
-# ───────────────────────── MQTT ───────────────────────── #
-MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
-MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
-# Single shared topic — every state change fires here. Subscribers filter
-# client-side on coordinates / type / status.
-MQTT_TOPIC = os.getenv("MQTT_TOPIC", "reports")
-# Retain pins only the LAST message on the topic — mostly useless with a
-# shared broadcast channel, so default off.
-MQTT_RETAIN = os.getenv("MQTT_RETAIN", "false").lower() == "true"
+ADMINS_COLL = os.getenv("ADMINS_COLL", "admins")
 
 # ───────────────────────── Geo cleanup ───────────────────────── #
 CLEANUP_RADIUS_M = float(os.getenv("CLEANUP_RADIUS_M", "500"))
 EARTH_RADIUS_M = 6_378_100.0
 LOCATION_PRECISION = int(os.getenv("LOCATION_PRECISION", "4"))
+
+# ───────────────────────── Admin seed ───────────────────────── #
+# Bootstrap-only: these emails are written into the `admins` collection on
+# first boot. After that, the DB is the source of truth — manage via
+# POST /admins / DELETE /admins/{email}. Set to empty to skip seeding.
+ADMIN_SEED_EMAILS: tuple[str, ...] = tuple(
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "duanand6@gmail.com").split(",")
+    if e.strip()
+)
 
 # ───────────────────────── Environmental metadata ───────────────────────── #
 CATEGORY_META = {

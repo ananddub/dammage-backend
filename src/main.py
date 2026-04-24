@@ -14,11 +14,11 @@ from PIL import Image, ImageOps
 from pydantic import BaseModel, Field
 from pymongo.collection import Collection
 
-from .config import CLEANUP_RADIUS_M, EARTH_RADIUS_M, LOCATION_PRECISION, MONGO_COLL
+from .config import ADMINS_COLL, CLEANUP_RADIUS_M, EARTH_RADIUS_M, LOCATION_PRECISION, MONGO_COLL
 from .ml import annotate, load_road, load_waste, run_road, run_waste
-from .storage import init_minio, init_mongo, init_mqtt, publish_report, upload
+from .storage import init_minio, init_mongo, upload
 
-_state: dict = {"waste": None, "road": None, "minio": None, "mongo": None, "mqtt": None}
+_state: dict = {"waste": None, "road": None, "minio": None, "mongo": None}
 
 # Bound concurrent YOLO inference. Single CPU-only host thrashes badly if N
 # torch passes run at once. Requests above the limit queue on the semaphore.
@@ -34,23 +34,34 @@ NOT_RESOLVED = {"$ne": True}
 VALID_STATUSES = {"pending", "acknowledged", "in_progress", "resolved", "rejected"}
 
 
+def _require_admin(email: str | None) -> str:
+    """Gate for mutation routes — looks the caller up in the `admins` collection."""
+    normalised = (email or "").strip().lower()
+    if not normalised:
+        raise HTTPException(403, "admin access required — supply an admin email")
+    db = _state.get("mongo")
+    if db is None:
+        raise HTTPException(503, "admin check unavailable — MongoDB is down")
+    if db[ADMINS_COLL].count_documents({"_id": normalised}, limit=1) == 0:
+        raise HTTPException(403, f"'{normalised}' is not an admin")
+    return normalised
+
+
+def _admin_emails() -> list[str]:
+    """Read current admin roster from Mongo (sorted). Returns [] if mongo is down."""
+    db = _state.get("mongo")
+    if db is None:
+        return []
+    return [d["_id"] for d in db[ADMINS_COLL].find({}, {"_id": 1}).sort("_id", 1)]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _state["waste"] = load_waste()
     _state["road"] = load_road()
     _state["minio"] = init_minio()
     _state["mongo"] = init_mongo()
-    _state["mqtt"] = init_mqtt()
-    try:
-        yield
-    finally:
-        mc = _state.get("mqtt")
-        if mc is not None:
-            try:
-                mc.loop_stop()
-                mc.disconnect()
-            except Exception:
-                pass
+    yield
 
 
 app = FastAPI(title="Dammage Detection API", lifespan=lifespan)
@@ -82,35 +93,13 @@ def _snap_coords(lng: float, lat: float) -> tuple[float, float]:
 
 
 def _soft_resolve(coll: Collection, query: dict, source: str) -> int:
-    """Flip resolved=True on all docs matching the query. Returns count.
-
-    Publishes each affected doc's fresh state to MQTT after the update.
-    """
+    """Flip resolved=True on all docs matching the query. Returns count."""
     query = {**query, "resolved": NOT_RESOLVED}
     now = datetime.now(timezone.utc)
-    ids = [d["_id"] for d in coll.find(query, {"_id": 1})]
-    if not ids:
-        return 0
-    coll.update_many({"_id": {"$in": ids}}, {
+    res = coll.update_many(query, {
         "$set": {"resolved": True, "resolved_at": now, "resolved_by": source}
     })
-    _publish_ids(coll, ids)
-    return len(ids)
-
-
-def _publish_ids(coll: Collection, ids: list) -> None:
-    """Fetch the latest state of each doc and push it over MQTT."""
-    mqtt_client = _state.get("mqtt")
-    if mqtt_client is None or not ids:
-        return
-    for doc in coll.find({"_id": {"$in": ids}}):
-        publish_report(mqtt_client, doc)
-
-
-def _publish_one(coll: Collection, report_id: str) -> None:
-    doc = coll.find_one({"_id": report_id})
-    if doc is not None:
-        publish_report(_state.get("mqtt"), doc)
+    return res.modified_count
 
 
 @app.get("/")
@@ -121,7 +110,6 @@ def root():
         "road_model": _state["road"] is not None,
         "minio": _state["minio"] is not None,
         "mongo": _state["mongo"] is not None,
-        "mqtt": _state["mqtt"] is not None,
         "endpoints": [
             "POST /report", "POST /resolve",
             "GET /reports", "PATCH /reports/{id}",
@@ -129,8 +117,10 @@ def root():
             "POST /reports/{id}/start",
             "POST /reports/{id}/resolve",
             "POST /reports/{id}/reject",
+            "GET /admins", "GET /admins/{email}", "POST /admins", "DELETE /admins/{email}",
         ],
         "statuses": sorted(VALID_STATUSES),
+        "admins": _admin_emails(),
     }
 
 
@@ -221,7 +211,6 @@ async def report(
             upsert=True,
         )
         inserted.append("trash")
-        _publish_one(coll, trash_id)
     if road_dets:
         coll.update_one(
             {"_id": pothole_id},
@@ -235,7 +224,6 @@ async def report(
             upsert=True,
         )
         inserted.append("pothole")
-        _publish_one(coll, pothole_id)
 
     # ── Stale-type sweep: if a prior scan at this exact spot flagged a type
     # that isn't in the current scan, the old doc now points at an annotated
@@ -274,7 +262,9 @@ def resolve(
     lng: float = Form(...),
     type: str | None = Form(None),
     radius_m: float = Form(CLEANUP_RADIUS_M),
+    admin: str = Form(""),
 ):
+    _require_admin(admin)
     db = _state.get("mongo")
     if db is None:
         raise HTTPException(500, "MongoDB not available")
@@ -284,7 +274,7 @@ def resolve(
     if type in ("trash", "pothole"):
         query["type"] = type
     resolved_count = _soft_resolve(db[MONGO_COLL], query, source="manual")
-    return {"resolved": True, "resolved_count": resolved_count, "radius_m": radius_m, "type": type}
+    return {"resolved": True, "resolved_count": resolved_count, "radius_m": radius_m, "type": type, "admin": admin}
 
 
 @app.get("/reports")
@@ -339,7 +329,8 @@ class StatusUpdate(BaseModel):
 
 
 def _apply_status(report_id: str, new_status: str, admin: str | None) -> dict:
-    """Shared path for every status-change route. Updates Mongo, publishes to MQTT."""
+    """Shared path for every status-change route. Updates Mongo."""
+    admin_email = _require_admin(admin)
     if new_status not in VALID_STATUSES:
         raise HTTPException(422, f"invalid status; allowed: {sorted(VALID_STATUSES)}")
     db = _state.get("mongo")
@@ -350,7 +341,7 @@ def _apply_status(report_id: str, new_status: str, admin: str | None) -> dict:
     update: dict = {
         "status": new_status,
         "status_updated_at": now,
-        "status_updated_by": admin or None,
+        "status_updated_by": admin_email,
     }
     # Sync the implicit `resolved` flag with admin-facing status.
     if new_status == "resolved":
@@ -363,12 +354,11 @@ def _apply_status(report_id: str, new_status: str, admin: str | None) -> dict:
     res = coll.update_one({"_id": report_id}, {"$set": update})
     if res.matched_count == 0:
         raise HTTPException(404, "report not found")
-    _publish_one(coll, report_id)
     return {
         "id": report_id,
         "status": new_status,
         "status_updated_at": now.isoformat(),
-        "status_updated_by": admin or None,
+        "status_updated_by": admin_email,
     }
 
 
@@ -396,3 +386,74 @@ def resolve_report(report_id: str, admin: str = Form("")):
 @app.post("/reports/{report_id}/reject")
 def reject(report_id: str, admin: str = Form("")):
     return _apply_status(report_id, "rejected", admin)
+
+
+# ─────────────────────── Admin roster CRUD ─────────────────────── #
+class AdminCreate(BaseModel):
+    email: str = Field(..., description="New admin's email (will be lowercased)")
+    name: str | None = Field(default=None, description="Optional display name")
+    admin: str = Field(..., description="Existing admin's email — grants auth to add")
+
+
+def _serialize_admin(d: dict) -> dict:
+    return {
+        "email": d["_id"],
+        "name": d.get("name"),
+        "added_at": d["added_at"].isoformat() if d.get("added_at") else None,
+        "added_by": d.get("added_by"),
+    }
+
+
+@app.get("/admins")
+def list_admins():
+    db = _state.get("mongo")
+    if db is None:
+        raise HTTPException(503, "MongoDB unavailable")
+    return [_serialize_admin(d) for d in db[ADMINS_COLL].find({}).sort("_id", 1)]
+
+
+@app.get("/admins/{email}")
+def check_admin(email: str):
+    """Verify whether `email` is in the admin roster. 200 with doc or 404."""
+    db = _state.get("mongo")
+    if db is None:
+        raise HTTPException(503, "MongoDB unavailable")
+    target = email.strip().lower()
+    doc = db[ADMINS_COLL].find_one({"_id": target})
+    if doc is None:
+        raise HTTPException(404, f"'{target}' is not an admin")
+    return _serialize_admin(doc)
+
+
+@app.post("/admins")
+def add_admin(body: AdminCreate):
+    actor = _require_admin(body.admin)
+    new_email = body.email.strip().lower()
+    if not new_email or "@" not in new_email:
+        raise HTTPException(422, "invalid email")
+    now = datetime.now(timezone.utc)
+    coll = _state["mongo"][ADMINS_COLL]
+    coll.update_one(
+        {"_id": new_email},
+        {
+            "$set": {"name": body.name},
+            "$setOnInsert": {"added_at": now, "added_by": actor},
+        },
+        upsert=True,
+    )
+    return _serialize_admin(coll.find_one({"_id": new_email}))
+
+
+@app.delete("/admins/{email}")
+def remove_admin(email: str, admin: str = ""):
+    actor = _require_admin(admin)
+    target = email.strip().lower()
+    if target == actor:
+        raise HTTPException(409, "admins cannot remove themselves")
+    coll = _state["mongo"][ADMINS_COLL]
+    if coll.count_documents({}) <= 1:
+        raise HTTPException(409, "cannot remove the last remaining admin")
+    res = coll.delete_one({"_id": target})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "admin not found")
+    return {"removed": target, "by": actor}
