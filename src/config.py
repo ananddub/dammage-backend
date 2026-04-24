@@ -92,6 +92,18 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017")
 MONGO_DB = os.getenv("MONGO_DB", "dammage")
 MONGO_COLL = os.getenv("MONGO_COLL", "reports")
 
+# ───────────────────────── MQTT ───────────────────────── #
+MQTT_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME") or None
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD") or None
+# Single shared topic — every state change fires here. Subscribers filter
+# client-side on coordinates / type / status.
+MQTT_TOPIC = os.getenv("MQTT_TOPIC", "reports")
+# Retain pins only the LAST message on the topic — mostly useless with a
+# shared broadcast channel, so default off.
+MQTT_RETAIN = os.getenv("MQTT_RETAIN", "false").lower() == "true"
+
 # ───────────────────────── Geo cleanup ───────────────────────── #
 CLEANUP_RADIUS_M = float(os.getenv("CLEANUP_RADIUS_M", "500"))
 EARTH_RADIUS_M = 6_378_100.0

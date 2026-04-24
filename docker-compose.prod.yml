@@ -20,13 +20,25 @@ services:
     command: server /data --console-address ":9001"
     restart: unless-stopped
 
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: dammage-mqtt
+    ports:
+      - "1883:1883"   # MQTT
+      - "9883:9001"   # MQTT over WebSockets (browser dashboards)
+    volumes:
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped
+
   backend:
     build: .
     container_name: dammage-backend
     ports:
       - "8000:8000"
     environment:
-      # In-network hostnames (backend ↔ minio/mongo)
+      # In-network hostnames (backend ↔ infra)
       MINIO_ENDPOINT: minio:9000
       MINIO_ROOT_USER: admin
       MINIO_ROOT_PASSWORD: password123
@@ -35,16 +47,25 @@ services:
       MINIO_PUBLIC_HOST: http://210.79.128.107:9000
       MONGO_URI: mongodb://mongodb:27017
       MONGO_DB: dammage
+      # MQTT — anyone can subscribe to mqtt://210.79.128.107:1883 / ws://…:9883
+      MQTT_HOST: mosquitto
+      MQTT_PORT: "1883"
+      MQTT_TOPIC_PREFIX: problem
+      MQTT_RETAIN: "true"
       # CPU-only host — disable tiled waste inference for usable latency
       WASTE_TILED: "false"
       WASTE_CONF: "0.08"
       CLEANUP_RADIUS_M: "500"
       LOCATION_PRECISION: "4"
+      INFERENCE_CONCURRENCY: "1"
     depends_on:
       - mongodb
       - minio
+      - mosquitto
     restart: unless-stopped
 
 volumes:
   mongo_data:
   minio_data:
+  mosquitto_data:
+  mosquitto_log:

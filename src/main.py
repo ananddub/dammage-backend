@@ -11,13 +11,14 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
+from pydantic import BaseModel, Field
 from pymongo.collection import Collection
 
 from .config import CLEANUP_RADIUS_M, EARTH_RADIUS_M, LOCATION_PRECISION, MONGO_COLL
 from .ml import annotate, load_road, load_waste, run_road, run_waste
-from .storage import init_minio, init_mongo, upload
+from .storage import init_minio, init_mongo, init_mqtt, publish_report, upload
 
-_state: dict = {"waste": None, "road": None, "minio": None, "mongo": None}
+_state: dict = {"waste": None, "road": None, "minio": None, "mongo": None, "mqtt": None}
 
 # Bound concurrent YOLO inference. Single CPU-only host thrashes badly if N
 # torch passes run at once. Requests above the limit queue on the semaphore.
@@ -29,6 +30,9 @@ _INFERENCE_SEM = asyncio.Semaphore(INFERENCE_CONCURRENCY)
 # running delete_many, so history stays queryable.
 NOT_RESOLVED = {"$ne": True}
 
+# Admin-controlled workflow status. `pending` on first upsert.
+VALID_STATUSES = {"pending", "acknowledged", "in_progress", "resolved", "rejected"}
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,7 +40,17 @@ async def lifespan(app: FastAPI):
     _state["road"] = load_road()
     _state["minio"] = init_minio()
     _state["mongo"] = init_mongo()
-    yield
+    _state["mqtt"] = init_mqtt()
+    try:
+        yield
+    finally:
+        mc = _state.get("mqtt")
+        if mc is not None:
+            try:
+                mc.loop_stop()
+                mc.disconnect()
+            except Exception:
+                pass
 
 
 app = FastAPI(title="Dammage Detection API", lifespan=lifespan)
@@ -68,13 +82,35 @@ def _snap_coords(lng: float, lat: float) -> tuple[float, float]:
 
 
 def _soft_resolve(coll: Collection, query: dict, source: str) -> int:
-    """Flip resolved=True on all docs matching the query. Returns count."""
+    """Flip resolved=True on all docs matching the query. Returns count.
+
+    Publishes each affected doc's fresh state to MQTT after the update.
+    """
     query = {**query, "resolved": NOT_RESOLVED}
     now = datetime.now(timezone.utc)
-    res = coll.update_many(query, {
+    ids = [d["_id"] for d in coll.find(query, {"_id": 1})]
+    if not ids:
+        return 0
+    coll.update_many({"_id": {"$in": ids}}, {
         "$set": {"resolved": True, "resolved_at": now, "resolved_by": source}
     })
-    return res.modified_count
+    _publish_ids(coll, ids)
+    return len(ids)
+
+
+def _publish_ids(coll: Collection, ids: list) -> None:
+    """Fetch the latest state of each doc and push it over MQTT."""
+    mqtt_client = _state.get("mqtt")
+    if mqtt_client is None or not ids:
+        return
+    for doc in coll.find({"_id": {"$in": ids}}):
+        publish_report(mqtt_client, doc)
+
+
+def _publish_one(coll: Collection, report_id: str) -> None:
+    doc = coll.find_one({"_id": report_id})
+    if doc is not None:
+        publish_report(_state.get("mqtt"), doc)
 
 
 @app.get("/")
@@ -85,7 +121,16 @@ def root():
         "road_model": _state["road"] is not None,
         "minio": _state["minio"] is not None,
         "mongo": _state["mongo"] is not None,
-        "endpoints": ["POST /report", "POST /resolve", "GET /reports"],
+        "mqtt": _state["mqtt"] is not None,
+        "endpoints": [
+            "POST /report", "POST /resolve",
+            "GET /reports", "PATCH /reports/{id}",
+            "POST /reports/{id}/acknowledge",
+            "POST /reports/{id}/start",
+            "POST /reports/{id}/resolve",
+            "POST /reports/{id}/reject",
+        ],
+        "statuses": sorted(VALID_STATUSES),
     }
 
 
@@ -145,7 +190,7 @@ async def report(
         "image": annotated_url or image_url,
         "image_original": image_url,
         "time": now,
-        # replace_one wipes all fields — explicitly mark fresh reports as active.
+        # Re-upload at a previously resolved spot → revive it.
         "resolved": False,
         "resolved_at": None,
         "resolved_by": None,
@@ -157,30 +202,40 @@ async def report(
         {k: v for k, v in d.items() if not k.startswith("_")} for d in waste_dets
     ]
 
-    # Deterministic _id per (spot, type) — same x,y re-upload overwrites this
-    # exact doc instead of creating a new ObjectId.
+    # Deterministic _id per (spot, type) — update_one with $inc preserves counters.
     trash_id = f"{coord_key}:trash"
     pothole_id = f"{coord_key}:pothole"
+    on_insert = {"created_at": now, "status": "pending", "status_updated_at": None, "status_updated_by": None}
 
     inserted: list[str] = []
     if waste_dets:
-        coll.replace_one(
+        coll.update_one(
             {"_id": trash_id},
-            {"_id": trash_id, **common, "type": "trash",
-             "severity_score": waste_sev, "environmental_impact": waste_imp,
-             "detections": waste_dets_persist, "stats": waste_stats},
+            {
+                "$set": {**common, "type": "trash",
+                         "severity_score": waste_sev, "environmental_impact": waste_imp,
+                         "detections": waste_dets_persist, "stats": waste_stats},
+                "$inc": {"report_count": 1},
+                "$setOnInsert": on_insert,
+            },
             upsert=True,
         )
         inserted.append("trash")
+        _publish_one(coll, trash_id)
     if road_dets:
-        coll.replace_one(
+        coll.update_one(
             {"_id": pothole_id},
-            {"_id": pothole_id, **common, "type": "pothole",
-             "severity_score": road_sev,
-             "detections": road_dets},
+            {
+                "$set": {**common, "type": "pothole",
+                         "severity_score": road_sev,
+                         "detections": road_dets},
+                "$inc": {"report_count": 1},
+                "$setOnInsert": on_insert,
+            },
             upsert=True,
         )
         inserted.append("pothole")
+        _publish_one(coll, pothole_id)
 
     # ── Stale-type sweep: if a prior scan at this exact spot flagged a type
     # that isn't in the current scan, the old doc now points at an annotated
@@ -233,7 +288,12 @@ def resolve(
 
 
 @app.get("/reports")
-def list_reports(limit: int = 200, type: str | None = None, include_resolved: bool = False):
+def list_reports(
+    limit: int = 200,
+    type: str | None = None,
+    status: str | None = None,
+    include_resolved: bool = False,
+):
     db = _state.get("mongo")
     if db is None:
         raise HTTPException(500, "MongoDB not available")
@@ -242,11 +302,15 @@ def list_reports(limit: int = 200, type: str | None = None, include_resolved: bo
         query["resolved"] = NOT_RESOLVED
     if type in ("trash", "pothole"):
         query["type"] = type
+    if status in VALID_STATUSES:
+        query["status"] = status
     cur = db[MONGO_COLL].find(
         query,
         {
             "_id": 1, "image": 1, "location.coordinates": 1, "time": 1,
             "severity_score": 1, "type": 1, "resolved": 1, "resolved_at": 1,
+            "status": 1, "status_updated_at": 1, "status_updated_by": 1,
+            "report_count": 1, "created_at": 1,
         },
     ).sort("time", -1).limit(int(limit))
     return [
@@ -257,8 +321,78 @@ def list_reports(limit: int = 200, type: str | None = None, include_resolved: bo
             "time": d["time"].isoformat(),
             "severity_score": d.get("severity_score", 0.0),
             "type": d.get("type"),
+            "status": d.get("status", "pending"),
+            "status_updated_at": d["status_updated_at"].isoformat() if d.get("status_updated_at") else None,
+            "status_updated_by": d.get("status_updated_by"),
+            "report_count": int(d.get("report_count", 1)),
+            "created_at": d["created_at"].isoformat() if d.get("created_at") else None,
             "resolved": bool(d.get("resolved")),
             "resolved_at": d["resolved_at"].isoformat() if d.get("resolved_at") else None,
         }
         for d in cur
     ]
+
+
+class StatusUpdate(BaseModel):
+    status: str = Field(..., description="New workflow status")
+    admin: str | None = Field(default=None, description="Who changed it (optional)")
+
+
+def _apply_status(report_id: str, new_status: str, admin: str | None) -> dict:
+    """Shared path for every status-change route. Updates Mongo, publishes to MQTT."""
+    if new_status not in VALID_STATUSES:
+        raise HTTPException(422, f"invalid status; allowed: {sorted(VALID_STATUSES)}")
+    db = _state.get("mongo")
+    if db is None:
+        raise HTTPException(500, "MongoDB not available")
+
+    now = datetime.now(timezone.utc)
+    update: dict = {
+        "status": new_status,
+        "status_updated_at": now,
+        "status_updated_by": admin or None,
+    }
+    # Sync the implicit `resolved` flag with admin-facing status.
+    if new_status == "resolved":
+        update.update({"resolved": True, "resolved_at": now, "resolved_by": "admin"})
+    elif new_status in ("pending", "acknowledged", "in_progress"):
+        update.update({"resolved": False, "resolved_at": None, "resolved_by": None})
+    # "rejected" leaves `resolved` untouched — admin filter handles visibility.
+
+    coll = db[MONGO_COLL]
+    res = coll.update_one({"_id": report_id}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(404, "report not found")
+    _publish_one(coll, report_id)
+    return {
+        "id": report_id,
+        "status": new_status,
+        "status_updated_at": now.isoformat(),
+        "status_updated_by": admin or None,
+    }
+
+
+@app.patch("/reports/{report_id}")
+def update_status(report_id: str, body: StatusUpdate):
+    return _apply_status(report_id, body.status, body.admin)
+
+
+# ── Explicit action routes — frontend admin UI buttons map 1:1 ── #
+@app.post("/reports/{report_id}/acknowledge")
+def ack(report_id: str, admin: str = Form("")):
+    return _apply_status(report_id, "acknowledged", admin)
+
+
+@app.post("/reports/{report_id}/start")
+def start(report_id: str, admin: str = Form("")):
+    return _apply_status(report_id, "in_progress", admin)
+
+
+@app.post("/reports/{report_id}/resolve")
+def resolve_report(report_id: str, admin: str = Form("")):
+    return _apply_status(report_id, "resolved", admin)
+
+
+@app.post("/reports/{report_id}/reject")
+def reject(report_id: str, admin: str = Form("")):
+    return _apply_status(report_id, "rejected", admin)
